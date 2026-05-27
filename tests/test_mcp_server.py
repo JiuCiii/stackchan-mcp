@@ -229,7 +229,7 @@ def test_stackchan_say_streams_pcm_with_fish_audio(server_module, monkeypatch):
 
 
 def test_stackchan_say_falls_back_to_wav_when_pcm_streaming_fails(
-    server_module, monkeypatch, tmp_path
+    server_module, monkeypatch, tmp_path, caplog
 ):
     wav_path = tmp_path / "fallback.wav"
     write_wav(wav_path)
@@ -258,12 +258,61 @@ def test_stackchan_say_falls_back_to_wav_when_pcm_streaming_fails(
 
     assert played_urls == ["http://192.0.2.10:5099/fallback.wav"]
     assert "Fish Audio/zh" in result
+    assert "PCM fallback" in result
+    assert "Falling back to WAV TTS after PCM failure: pcm failed" in caplog.text
+
+
+def test_stackchan_say_falls_back_to_wav_when_pcm_play_is_unsuccessful(
+    server_module, monkeypatch, tmp_path, caplog
+):
+    wav_path = tmp_path / "fallback.wav"
+    write_wav(wav_path)
+
+    monkeypatch.setattr(server_module, "TTS_ENGINE", "fish-audio")
+    monkeypatch.setattr(server_module, "FISH_AUDIO_KEY", "test-key")
+    monkeypatch.setattr(server_module, "start_audio_server", lambda: None)
+    monkeypatch.setattr(server_module, "iter_fish_pcm_stream", lambda text, lang: iter([b"\x00\x00"]))
+    monkeypatch.setattr(server_module, "stackchan_play_pcm", lambda _pcm_chunks: {"success": False})
+    monkeypatch.setattr(server_module, "generate_tts", lambda _text, _lang: wav_path)
+    monkeypatch.setattr(server_module, "stackchan_play", lambda _url: {"success": True})
+
+    result = server_module.stackchan_say("hello", "zh")
+
+    assert "Fish Audio/zh" in result
+    assert "PCM fallback" in result
+    assert "PCM play returned {'success': False}" in caplog.text
+
+
+def test_stackchan_say_does_not_fallback_after_pcm_audio_started(server_module, monkeypatch):
+    monkeypatch.setattr(server_module, "TTS_ENGINE", "fish-audio")
+    monkeypatch.setattr(server_module, "FISH_AUDIO_KEY", "test-key")
+    monkeypatch.setattr(server_module, "start_audio_server", lambda: None)
+    monkeypatch.setattr(
+        server_module,
+        "stackchan_play_pcm",
+        lambda _chunks: (_ for _ in ()).throw(
+            server_module.PcmPlaybackError("segment failed", started=True)
+        ),
+    )
+
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("WAV fallback should not run after PCM audio started")
+
+    monkeypatch.setattr(server_module, "generate_tts", fail_if_called)
+    monkeypatch.setattr(server_module, "stackchan_play", fail_if_called)
+
+    result = server_module.stackchan_say("hello", "zh")
+
+    assert "PCM playback failed after audio started" in result
 
 
 def test_stackchan_play_pcm_posts_binary_payload_with_content_length(server_module, monkeypatch):
     request_kwargs = {}
 
     class FakeResponse:
+        def raise_for_status(self):
+            return None
+
         def json(self):
             return {"success": True}
 
@@ -278,7 +327,97 @@ def test_stackchan_play_pcm_posts_binary_payload_with_content_length(server_modu
 
     assert result == {"success": True}
     assert request_kwargs["kwargs"]["data"] == b"\x01\x00\x02\x00"
+    assert isinstance(request_kwargs["kwargs"]["data"], bytes)
     assert request_kwargs["kwargs"]["headers"]["Content-Type"].startswith("audio/x-raw")
+    assert "final=1" in request_kwargs["args"][0]
+
+
+def test_stackchan_play_pcm_rejects_oversized_payload_before_http_post(
+    server_module, monkeypatch
+):
+    max_size = server_module.MAX_PCM_PAYLOAD_BYTES
+
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("Oversized PCM should be rejected before HTTP post")
+
+    monkeypatch.setattr(server_module.requests, "post", fail_if_called)
+
+    with pytest.raises(ValueError, match="PCM payload too large"):
+        server_module.stackchan_play_pcm(iter([b"\x00" * (max_size + 2)]))
+
+
+def test_stackchan_play_pcm_posts_large_payload_in_segments(server_module, monkeypatch):
+    posted = []
+    urls = []
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"success": True}
+
+    def fake_post(url, **kwargs):
+        urls.append(url)
+        posted.append(kwargs["data"])
+        return FakeResponse()
+
+    monkeypatch.setattr(server_module.requests, "post", fake_post)
+    segment_size = server_module.PCM_SEGMENT_BYTES
+
+    result = server_module.stackchan_play_pcm(iter([b"\x00\x00" * ((segment_size // 2) + 4)]))
+
+    assert result == {"success": True}
+    assert len(posted) == 2
+    assert len(posted[0]) == segment_size
+    assert posted[1] == b"\x00\x00" * 4
+    assert "final=0" in urls[0]
+    assert "final=1" in urls[1]
+
+
+def test_stackchan_play_pcm_raises_for_http_error(server_module, monkeypatch):
+    class FakeResponse:
+        text = "{\"success\":false,\"error\":\"playback busy\"}"
+
+        def raise_for_status(self):
+            error = server_module.requests.HTTPError("409 Client Error")
+            error.response = self
+            raise error
+
+    monkeypatch.setattr(server_module.requests, "post", lambda *_args, **_kwargs: FakeResponse())
+
+    with pytest.raises(server_module.PcmPlaybackError, match="PCM segment HTTP failed"):
+        server_module.stackchan_play_pcm(iter([b"\x00\x00"]))
+
+
+def test_stackchan_play_pcm_marks_late_invalid_payload_as_started(server_module, monkeypatch):
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"success": True}
+
+    monkeypatch.setattr(server_module.requests, "post", lambda *_args, **_kwargs: FakeResponse())
+    segment = b"\x00\x00" * (server_module.PCM_SEGMENT_BYTES // 2)
+
+    with pytest.raises(server_module.PcmPlaybackError) as excinfo:
+        server_module.stackchan_play_pcm(iter([segment, segment, b"\x01"]))
+
+    assert excinfo.value.started is True
+
+
+@pytest.mark.parametrize("pcm_chunks", [[], [b""], [b"\x00"]])
+def test_stackchan_play_pcm_rejects_empty_or_odd_byte_payload_before_http_post(
+    server_module, monkeypatch, pcm_chunks
+):
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("Invalid PCM should be rejected before HTTP post")
+
+    monkeypatch.setattr(server_module.requests, "post", fail_if_called)
+
+    with pytest.raises(ValueError, match="invalid PCM payload size"):
+        server_module.stackchan_play_pcm(iter(pcm_chunks))
 
 
 def test_iter_fish_pcm_stream_requests_pcm_chunks(server_module, monkeypatch):

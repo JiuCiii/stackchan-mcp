@@ -210,12 +210,47 @@ For lower latency speech, firmware also accepts `POST /play/pcm` with raw PCM:
 
 - Format: 24 kHz, mono, signed 16-bit little-endian.
 - Content type: `audio/x-raw;format=s16le;rate=24000;channels=1`.
+- MCP sends PCM in 48 KiB segments and firmware accepts later segments with
+  `202 Accepted` while the current PCM segment is playing.
+- Each PCM segment includes `session`, `seq`, and `final` query parameters.
+  Firmware only queues segments for the active PCM session and logs the session
+  id, segment size, final flag, and queued byte count.
 - The firmware stops the microphone, starts speaker playback with
-  `M5.Speaker.playRaw()`, computes lip sync from PCM amplitude, and requests
-  microphone resume after playback completes.
+  `M5.Speaker.playRaw()`, computes lip sync from PCM amplitude, and queues
+  subsequent PCM segments while the current PCM segment is playing.
+- Playback timeout clears any queued PCM segments before resuming normal audio
+  queue processing, so stale segments from a broken stream are not replayed.
+- The MCP server posts Fish PCM in bounded segments so playback can start
+  before the full TTS response has completed. Each segment is still sent as a
+  normal HTTP request with `Content-Length`, because the ESP32 `WebServer`
+  handler is not compatible with chunked request bodies.
 - The MCP server tries Fish Audio PCM streaming first when `TTS_ENGINE` is
   `fish-audio` and `FISH_AUDIO_KEY` is set. If streaming setup or playback
-  fails, it falls back to the existing WAV `/play` path.
+  fails before any PCM segment is accepted, it falls back to the existing WAV
+  `/play` path. If a later PCM segment fails after audio has started, MCP
+  returns an error instead of falling back to WAV to avoid duplicate speech.
+
+Safe playback smoke tests:
+
+```sh
+# Non-destructive device reachability check.
+curl -sS --max-time 5 "http://$STACKCHAN_IP/face"
+
+# MCP TTS path. With Fish Audio credentials this tries segmented PCM first;
+# without them it uses the validated WAV fallback.
+MAC_IP="$MAC_IP" STACKCHAN_IP="$STACKCHAN_IP" \
+  uv run python - <<'PY'
+import importlib.util
+from pathlib import Path
+
+spec = importlib.util.spec_from_file_location(
+    "stackchan_mcp_server", Path("mcp-server/server.py")
+)
+server = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(server)
+print(server.stackchan_say("Stack-chan playback test.", "en"))
+PY
+```
 
 ## Microphone Modes
 

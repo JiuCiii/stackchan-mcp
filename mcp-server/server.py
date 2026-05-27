@@ -12,6 +12,7 @@ Usage:
   python server.py --http --port 8001  # HTTP mode (for Claude Chat/Cowork)
 """
 
+import logging
 import os
 import subprocess
 import sys as _sys
@@ -42,6 +43,16 @@ PCM_SAMPLE_RATE = 24000
 PCM_CHANNELS = 1
 PCM_SAMPLE_WIDTH = 2
 PCM_CONTENT_TYPE = "audio/x-raw;format=s16le;rate=24000;channels=1"
+MAX_PCM_PAYLOAD_BYTES = 2 * 1024 * 1024
+PCM_SEGMENT_BYTES = 48 * 1024
+
+logger = logging.getLogger(__name__)
+
+
+class PcmPlaybackError(RuntimeError):
+    def __init__(self, message: str, *, started: bool = False):
+        super().__init__(message)
+        self.started = started
 
 # Voice mapping for edge-tts
 EDGE_VOICES = {
@@ -258,18 +269,94 @@ def stackchan_play(wav_url: str) -> dict:
 
 
 def stackchan_play_pcm(pcm_chunks) -> dict:
-    """Push raw 24kHz mono s16le PCM to Stack-chan for playback."""
-    pcm = b"".join(pcm_chunks)
-    if not pcm or len(pcm) % PCM_SAMPLE_WIDTH != 0:
-        raise ValueError(f"invalid PCM payload size: {len(pcm)}")
+    """Push raw 24kHz mono s16le PCM to Stack-chan in low-latency segments."""
+    buffer = bytearray()
+    total_size = 0
+    last_result = None
+    session_id = uuid.uuid4().hex
+    segment_index = 0
+    started = False
+    pending_segment = None
 
-    resp = requests.post(
-        f"http://{STACKCHAN_IP}:{STACKCHAN_PORT}/play/pcm",
-        data=pcm,
-        headers={"Content-Type": PCM_CONTENT_TYPE},
-        timeout=30,
-    )
-    return resp.json()
+    def post_segment(segment: bytes, *, final: bool) -> dict:
+        nonlocal segment_index, started
+        if not segment or len(segment) % PCM_SAMPLE_WIDTH != 0:
+            raise ValueError(f"invalid PCM payload size: {len(segment)}")
+        url = (
+            f"http://{STACKCHAN_IP}:{STACKCHAN_PORT}/play/pcm"
+            f"?session={session_id}&seq={segment_index}&final={1 if final else 0}"
+        )
+        try:
+            resp = requests.post(
+                url,
+                data=segment,
+                headers={"Content-Type": PCM_CONTENT_TYPE},
+                timeout=30,
+            )
+            resp.raise_for_status()
+            result = resp.json()
+        except requests.HTTPError as exc:
+            body = getattr(exc.response, "text", "") if exc.response is not None else ""
+            raise PcmPlaybackError(
+                f"PCM segment HTTP failed: {exc} body={body[:200]}",
+                started=started,
+            ) from exc
+        except ValueError as exc:
+            raise PcmPlaybackError(
+                f"PCM segment returned invalid JSON: {exc}",
+                started=started,
+            ) from exc
+        except requests.RequestException as exc:
+            raise PcmPlaybackError(f"PCM segment request failed: {exc}", started=started) from exc
+
+        if not result.get("success"):
+            raise PcmPlaybackError(f"PCM segment play failed: {result}", started=started)
+        started = True
+        logger.info(
+            "Posted PCM segment session=%s seq=%d bytes=%d final=%s queued=%s",
+            session_id,
+            segment_index,
+            len(segment),
+            final,
+            result.get("queued"),
+        )
+        segment_index += 1
+        return result
+
+    for chunk in pcm_chunks:
+        if not chunk:
+            continue
+        total_size += len(chunk)
+        if total_size > MAX_PCM_PAYLOAD_BYTES:
+            message = (
+                "PCM payload too large: "
+                f"{total_size} bytes exceeds {MAX_PCM_PAYLOAD_BYTES} byte limit"
+            )
+            if started:
+                raise PcmPlaybackError(message, started=True)
+            raise ValueError(message)
+        buffer.extend(chunk)
+        while len(buffer) >= PCM_SEGMENT_BYTES:
+            segment_size = PCM_SEGMENT_BYTES - (PCM_SEGMENT_BYTES % PCM_SAMPLE_WIDTH)
+            if pending_segment is not None:
+                last_result = post_segment(pending_segment, final=False)
+            pending_segment = bytes(buffer[:segment_size])
+            del buffer[:segment_size]
+
+    if not buffer and pending_segment is None and last_result is None:
+        raise ValueError("invalid PCM payload size: 0")
+    if len(buffer) % PCM_SAMPLE_WIDTH != 0:
+        message = f"invalid PCM payload size: {len(buffer)}"
+        if started:
+            raise PcmPlaybackError(message, started=True)
+        raise ValueError(message)
+    if buffer:
+        if pending_segment is not None:
+            last_result = post_segment(pending_segment, final=False)
+        last_result = post_segment(bytes(buffer), final=True)
+    elif pending_segment is not None:
+        last_result = post_segment(pending_segment, final=True)
+    return last_result or {"success": False, "error": "no pcm"}
 
 
 def stackchan_get_audio() -> bytes | None:
@@ -378,15 +465,25 @@ def stackchan_say(text: str, lang: str = "zh") -> str:
     start_audio_server()
 
     try:
+        pcm_fallback_reason = None
         if can_stream_pcm():
             try:
                 result = stackchan_play_pcm(iter_fish_pcm_stream(text, lang))
                 if result.get("success"):
                     return f"🗣️ Stack-chan is saying: \"{text[:60]}{'…' if len(text)>60 else ''}\" [Fish Audio PCM/{lang}]"
-            except Exception:
+                pcm_fallback_reason = f"PCM play returned {result}"
+                logger.warning("Falling back to WAV TTS: %s", pcm_fallback_reason)
+            except PcmPlaybackError as exc:
+                if exc.started:
+                    logger.error("PCM playback failed after audio started: %s", exc)
+                    return f"❌ PCM playback failed after audio started: {exc}"
+                pcm_fallback_reason = str(exc)
+                logger.warning("Falling back to WAV TTS after PCM failure: %s", exc)
+            except Exception as exc:
                 # Keep the stable WAV path as a fallback when streaming is unavailable
                 # or firmware rejects the PCM endpoint.
-                pass
+                pcm_fallback_reason = str(exc)
+                logger.warning("Falling back to WAV TTS after PCM failure: %s", exc)
 
         wav_path = generate_tts(text, lang)
         validate_playback_wav(wav_path)
@@ -395,7 +492,8 @@ def stackchan_say(text: str, lang: str = "zh") -> str:
 
         if result.get("success"):
             engine = "Fish Audio" if (TTS_ENGINE == "fish-audio" and FISH_AUDIO_KEY) else "edge-tts"
-            return f"🗣️ Stack-chan is saying: \"{text[:60]}{'…' if len(text)>60 else ''}\" [{engine}/{lang}]"
+            fallback_note = " (PCM fallback)" if pcm_fallback_reason else ""
+            return f"🗣️ Stack-chan is saying: \"{text[:60]}{'…' if len(text)>60 else ''}\" [{engine}/{lang}]{fallback_note}"
         else:
             return f"❌ Play failed: {result}"
     except Exception as e:

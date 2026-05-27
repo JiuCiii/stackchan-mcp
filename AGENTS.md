@@ -28,6 +28,10 @@ Stack-chan voice avatar running on M5Stack CoreS3.
 The firmware exposes a local HTTP API on port 80:
 
 - `POST /play` queues a WAV URL for playback.
+- `POST /play/pcm?session=<id>&seq=<n>&final=<0|1>` plays or queues a raw
+  `24kHz` mono `s16le` PCM segment. The MCP server sends Fish PCM in bounded
+  segments with `Content-Length`; firmware only queues segments for the active
+  PCM session and clears queued PCM on playback timeout.
 - `POST /mode` switches between `api` and `mcp` recording behavior.
 - `GET /audio/status` reports whether a recording is ready.
 - `GET /audio` returns the latest WAV recording and then clears it.
@@ -146,7 +150,7 @@ recording.
 <claude-mem-context>
 # Memory Context
 
-# [stackchan] recent context, 2026-05-28 2:42am GMT+9
+# [stackchan] recent context, 2026-05-28 3:16am GMT+9
 
 No previous sessions found.
 </claude-mem-context>

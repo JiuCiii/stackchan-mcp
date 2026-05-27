@@ -19,12 +19,53 @@ static bool     s_wav_ready = false;
 
 static uint8_t* s_pcm_upload_buf = nullptr;
 static size_t   s_pcm_upload_size = 0;
+static size_t   s_pcm_upload_capacity = 0;
 static bool     s_pcm_upload_ready = false;
+static const char* s_pcm_upload_error = nullptr;
 
 #define HTTP_PCM_MAX_BYTES (2 * 1024 * 1024)
 
 // ── モードフラグ（false=APIモード / true=MCPモード）
 static bool s_mcp_mode = false;
+
+static void clearPcmUpload() {
+    if (s_pcm_upload_buf) {
+        free(s_pcm_upload_buf);
+    }
+    s_pcm_upload_buf = nullptr;
+    s_pcm_upload_size = 0;
+    s_pcm_upload_capacity = 0;
+    s_pcm_upload_ready = false;
+}
+
+static bool reservePcmUpload(size_t requiredSize) {
+    if (requiredSize <= s_pcm_upload_capacity) {
+        return true;
+    }
+
+    size_t newCapacity = s_pcm_upload_capacity ? s_pcm_upload_capacity : 8192;
+    while (newCapacity < requiredSize) {
+        if (newCapacity > HTTP_PCM_MAX_BYTES / 2) {
+            newCapacity = HTTP_PCM_MAX_BYTES;
+            break;
+        }
+        newCapacity *= 2;
+    }
+
+    uint8_t* newBuf = (uint8_t*)ps_malloc(newCapacity);
+    if (!newBuf) {
+        return false;
+    }
+    if (s_pcm_upload_buf && s_pcm_upload_size > 0) {
+        memcpy(newBuf, s_pcm_upload_buf, s_pcm_upload_size);
+    }
+    if (s_pcm_upload_buf) {
+        free(s_pcm_upload_buf);
+    }
+    s_pcm_upload_buf = newBuf;
+    s_pcm_upload_capacity = newCapacity;
+    return true;
+}
 
 // ────────────────────────────────────────────
 // POST /play
@@ -64,50 +105,75 @@ static void handlePlay() {
 // body: raw 24kHz mono s16le PCM
 // ────────────────────────────────────────────
 static void handlePlayPcm() {
+    if (s_pcm_upload_error) {
+        String body = "{\"success\":false,\"error\":\"";
+        body += s_pcm_upload_error;
+        body += "\"}";
+        s_pcm_upload_error = nullptr;
+        clearPcmUpload();
+        server.send(400, "application/json", body);
+        return;
+    }
     if (!s_pcm_upload_ready || s_pcm_upload_buf == nullptr || s_pcm_upload_size == 0) {
         server.send(400, "application/json", "{\"success\":false,\"error\":\"no pcm body\"}");
         return;
     }
 
     const size_t pcmSize = s_pcm_upload_size;
-    bool ok = startPcmPlayback(s_pcm_upload_buf, pcmSize);
-    free(s_pcm_upload_buf);
+    String sessionId = server.arg("session");
+    bool finalSegment = server.arg("final") == "1" || server.arg("final") == "true";
+    uint8_t* pcmData = s_pcm_upload_buf;
     s_pcm_upload_buf = nullptr;
     s_pcm_upload_size = 0;
+    s_pcm_upload_capacity = 0;
     s_pcm_upload_ready = false;
 
-    if (!ok) {
-        server.send(400, "application/json", "{\"success\":false,\"error\":\"invalid pcm\"}");
+    PcmPlaybackResult result = startPcmPlayback(pcmData, pcmSize, sessionId, finalSegment);
+    if (result != PCM_PLAYBACK_OK && result != PCM_PLAYBACK_QUEUED) {
+        free(pcmData);
+        if (result == PCM_PLAYBACK_BUSY) {
+            server.send(409, "application/json", "{\"success\":false,\"error\":\"playback busy\"}");
+        } else if (result == PCM_PLAYBACK_SESSION_MISMATCH) {
+            server.send(409, "application/json", "{\"success\":false,\"error\":\"pcm session mismatch\"}");
+        } else if (result == PCM_PLAYBACK_SPEAKER_FAILED) {
+            server.send(500, "application/json", "{\"success\":false,\"error\":\"speaker failed\"}");
+        } else {
+            server.send(400, "application/json", "{\"success\":false,\"error\":\"invalid pcm\"}");
+        }
         return;
     }
 
-    Serial.printf("[HTTP] POST /play/pcm -> %u bytes\n", (unsigned)pcmSize);
-    server.send(200, "application/json", "{\"success\":true,\"format\":\"s16le\",\"sample_rate\":24000,\"channels\":1}");
+    Serial.printf("[HTTP] POST /play/pcm -> session=%s bytes=%u final=%s result=%d\n",
+                  sessionId.c_str(), (unsigned)pcmSize,
+                  finalSegment ? "true" : "false", result);
+    if (result == PCM_PLAYBACK_QUEUED) {
+        server.send(202, "application/json", "{\"success\":true,\"queued\":true,\"format\":\"s16le\",\"sample_rate\":24000,\"channels\":1}");
+    } else {
+        server.send(200, "application/json", "{\"success\":true,\"queued\":false,\"format\":\"s16le\",\"sample_rate\":24000,\"channels\":1}");
+    }
 }
 
 static void handlePlayPcmRaw() {
     HTTPRaw& raw = server.raw();
 
     if (raw.status == RAW_START) {
-        if (s_pcm_upload_buf) {
-            free(s_pcm_upload_buf);
-        }
-        s_pcm_upload_buf = (uint8_t*)ps_malloc(HTTP_PCM_MAX_BYTES);
-        s_pcm_upload_size = 0;
-        s_pcm_upload_ready = false;
-        if (!s_pcm_upload_buf) {
-            Serial.println("[HTTP] PCM upload alloc failed");
-        }
+        clearPcmUpload();
+        s_pcm_upload_error = nullptr;
         return;
     }
 
     if (raw.status == RAW_WRITE) {
-        if (!s_pcm_upload_buf) return;
         if (raw.currentSize > HTTP_PCM_MAX_BYTES - s_pcm_upload_size) {
+            s_pcm_upload_error = "pcm too large";
             Serial.println("[HTTP] PCM upload too large");
-            free(s_pcm_upload_buf);
-            s_pcm_upload_buf = nullptr;
-            s_pcm_upload_size = 0;
+            clearPcmUpload();
+            return;
+        }
+        size_t newSize = s_pcm_upload_size + raw.currentSize;
+        if (!reservePcmUpload(newSize)) {
+            s_pcm_upload_error = "pcm alloc failed";
+            Serial.println("[HTTP] PCM upload alloc failed");
+            clearPcmUpload();
             return;
         }
         memcpy(s_pcm_upload_buf + s_pcm_upload_size, raw.buf, raw.currentSize);
@@ -121,12 +187,8 @@ static void handlePlayPcmRaw() {
     }
 
     if (raw.status == RAW_ABORTED) {
-        if (s_pcm_upload_buf) {
-            free(s_pcm_upload_buf);
-        }
-        s_pcm_upload_buf = nullptr;
-        s_pcm_upload_size = 0;
-        s_pcm_upload_ready = false;
+        s_pcm_upload_error = "pcm upload aborted";
+        clearPcmUpload();
     }
 }
 

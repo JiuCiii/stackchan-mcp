@@ -2,6 +2,7 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <math.h>
+#include <queue>
 #include "playback_service.h"
 #include "globals.h"
 #include "config.h"
@@ -21,6 +22,7 @@ static uint16_t currentBytesPerFrame = 2;
 #define PCM_SAMPLE_RATE       24000
 #define PCM_BYTES_PER_SAMPLE  2
 #define MAX_PCM_BYTES         (2 * 1024 * 1024)
+#define MAX_QUEUED_PCM_BYTES  (2 * 1024 * 1024)
 
 // ── FreeRTOS: URLをCore 0に渡すキュー
 //    StringはFreeRTOSキューに乗せられないのでchar配列で渡す
@@ -31,6 +33,19 @@ static QueueHandle_t s_downloadQueue = nullptr;
 static volatile bool s_pendingReady = false;
 static uint8_t*      s_pendingData  = nullptr;
 static size_t        s_pendingSize  = 0;
+
+struct PcmBuffer {
+    uint8_t* data;
+    size_t size;
+    String sessionId;
+    bool finalSegment;
+};
+
+static std::queue<PcmBuffer> s_pcmQueue;
+static size_t s_pcmQueuedBytes = 0;
+static bool s_currentPlaybackIsPcm = false;
+static String s_currentPcmSessionId = "";
+static bool s_currentPcmFinalSegment = false;
 
 struct WavInfo {
     size_t dataOffset;
@@ -119,6 +134,29 @@ static bool parseWavInfo(const uint8_t* data, size_t size, WavInfo* info) {
     }
 
     *info = parsed;
+    return true;
+}
+
+void clearQueuedPcmPlayback() {
+    while (!s_pcmQueue.empty()) {
+        PcmBuffer dropped = s_pcmQueue.front();
+        s_pcmQueue.pop();
+        free(dropped.data);
+    }
+    s_pcmQueuedBytes = 0;
+    Serial.println("[PCM] Queue cleared");
+}
+
+static bool enqueuePcmBuffer(uint8_t* pcmData, size_t pcmSize, const String& sessionId, bool finalSegment) {
+    if (pcmSize > MAX_QUEUED_PCM_BYTES - s_pcmQueuedBytes) {
+        Serial.println("[PCM] Queue full");
+        return false;
+    }
+    s_pcmQueue.push({pcmData, pcmSize, sessionId, finalSegment});
+    s_pcmQueuedBytes += pcmSize;
+    Serial.printf("[PCM] Queued segment: session=%s bytes=%u queued=%u final=%s\n",
+                  sessionId.c_str(), (unsigned)pcmSize,
+                  (unsigned)s_pcmQueuedBytes, finalSegment ? "true" : "false");
     return true;
 }
 
@@ -237,18 +275,39 @@ void checkPendingPlayback() {
     lipSyncOffset = currentPcmOffset;
     lastLipMs     = 0;
     isPlaying     = true;
+    s_currentPlaybackIsPcm = false;
+    s_currentPcmSessionId = "";
+    s_currentPcmFinalSegment = false;
+    clearQueuedPcmPlayback();
     playbackStartMs  = millis();
     Serial.println("[PLAY] Speaker started");
 }
 
-bool startPcmPlayback(const uint8_t* pcmData, size_t pcmSize) {
+PcmPlaybackResult startPcmPlayback(uint8_t* pcmData, size_t pcmSize, const String& sessionId, bool finalSegment) {
     if (!pcmData || pcmSize == 0) {
         Serial.println("[PCM] Empty body");
-        return false;
+        return PCM_PLAYBACK_INVALID;
+    }
+    if (sessionId.length() == 0) {
+        Serial.println("[PCM] Missing session id");
+        return PCM_PLAYBACK_INVALID;
     }
     if ((pcmSize % PCM_BYTES_PER_SAMPLE) != 0 || pcmSize > MAX_PCM_BYTES) {
         Serial.printf("[PCM] Invalid size: %u\n", (unsigned)pcmSize);
-        return false;
+        return PCM_PLAYBACK_INVALID;
+    }
+    if (isPlaying || M5.Speaker.isPlaying()) {
+        if (s_currentPlaybackIsPcm && sessionId == s_currentPcmSessionId &&
+            enqueuePcmBuffer(pcmData, pcmSize, sessionId, finalSegment)) {
+            return PCM_PLAYBACK_QUEUED;
+        }
+        Serial.printf("[PCM] Busy; refusing segment session=%s current=%s\n",
+                      sessionId.c_str(), s_currentPcmSessionId.c_str());
+        return PCM_PLAYBACK_BUSY;
+    }
+
+    if (!s_pcmQueue.empty()) {
+        clearQueuedPcmPlayback();
     }
 
     if (currentWavData) {
@@ -257,14 +316,7 @@ bool startPcmPlayback(const uint8_t* pcmData, size_t pcmSize) {
         currentWavSize = 0;
     }
 
-    uint8_t* copied = (uint8_t*)ps_malloc(pcmSize);
-    if (!copied) {
-        Serial.println("[PCM] ps_malloc failed");
-        return false;
-    }
-    memcpy(copied, pcmData, pcmSize);
-
-    currentWavData = copied;
+    currentWavData = pcmData;
     currentWavSize = pcmSize;
     currentPcmOffset = 0;
     currentPcmSize = pcmSize;
@@ -293,20 +345,25 @@ bool startPcmPlayback(const uint8_t* pcmData, size_t pcmSize) {
                                  true);
     if (!ok) {
         Serial.println("[PCM] Speaker rejected playRaw");
-        free(currentWavData);
         currentWavData = nullptr;
         currentWavSize = 0;
         setFaceExpression(FACE_IDLE);
-        return false;
+        micResumeRequested = true;
+        return PCM_PLAYBACK_SPEAKER_FAILED;
     }
 
     setFaceExpression(FACE_PLAYING);
     lipSyncOffset = 0;
     lastLipMs = 0;
     isPlaying = true;
+    s_currentPlaybackIsPcm = true;
+    s_currentPcmSessionId = sessionId;
+    s_currentPcmFinalSegment = finalSegment;
     playbackStartMs = millis();
-    Serial.printf("[PCM] Speaker started: %u bytes @ 24kHz mono s16le\n", (unsigned)pcmSize);
-    return true;
+    Serial.printf("[PCM] Speaker started: session=%s bytes=%u final=%s queue=%u @ 24kHz mono s16le\n",
+                  sessionId.c_str(), (unsigned)pcmSize,
+                  finalSegment ? "true" : "false", (unsigned)s_pcmQueuedBytes);
+    return PCM_PLAYBACK_OK;
 }
 
 // ════════════════════════════════════════
@@ -430,7 +487,33 @@ void processAudioQueue() {
 
     setMouthOpen(0.0f);
 
+    if (!s_pcmQueue.empty()) {
+        PcmBuffer nextPcm = s_pcmQueue.front();
+        s_pcmQueue.pop();
+        s_pcmQueuedBytes -= nextPcm.size;
+
+        PcmPlaybackResult result = startPcmPlayback(
+            nextPcm.data,
+            nextPcm.size,
+            nextPcm.sessionId,
+            nextPcm.finalSegment
+        );
+        if (result != PCM_PLAYBACK_OK) {
+            free(nextPcm.data);
+            Serial.printf("[PCM] Dropped queued segment: result=%d\n", result);
+        }
+        if (isPlaying) {
+            return;
+        }
+    }
+
     if (audioQueue.empty()) {
+        if (s_currentPlaybackIsPcm && s_currentPcmFinalSegment) {
+            Serial.printf("[PCM] Session complete: %s\n", s_currentPcmSessionId.c_str());
+        }
+        s_currentPlaybackIsPcm = false;
+        s_currentPcmSessionId = "";
+        s_currentPcmFinalSegment = false;
         setFaceExpression(FACE_IDLE);
         return;
     }

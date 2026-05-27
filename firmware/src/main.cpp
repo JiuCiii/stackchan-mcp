@@ -77,6 +77,7 @@ void loop() {
         if (playbackDeadlineMs != 0 && millis() > playbackDeadlineMs) {
             Serial.println("[PLAY] Playback timeout -> force stop");
             M5.Speaker.stop();
+            clearQueuedPcmPlayback();
         }
         notifyPlaybackFinished();
     }
