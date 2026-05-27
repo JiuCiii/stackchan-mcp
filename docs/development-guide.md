@@ -157,6 +157,7 @@ The firmware exposes an HTTP API on port 80.
 | Method | Path | Purpose | Notes |
 | --- | --- | --- | --- |
 | `POST` | `/play` | Queue a WAV URL for playback | Body: `{"voice_url":"http://..."}` |
+| `POST` | `/play/pcm` | Play raw PCM audio | Body is 24 kHz mono signed 16-bit little-endian PCM |
 | `POST` | `/mode` | Switch recording behavior | Body: `{"mode":"api"}` or `{"mode":"mcp"}` |
 | `GET` | `/audio/status` | Check recording state | Returns `ready` and `mode` |
 | `GET` | `/audio` | Fetch latest WAV recording | Consumes and clears readiness |
@@ -191,7 +192,7 @@ recording.
 
 ## Audio Flow
 
-Playback is push-based:
+WAV playback is push-based:
 
 1. A host or MCP tool generates a WAV file and serves it over HTTP.
 2. The host sends `POST /play` to Stack-chan with the `voice_url`.
@@ -202,8 +203,19 @@ Playback is push-based:
 6. Lip sync reads PCM amplitude from the WAV data and toggles mouth state.
 7. Playback completion stops the speaker path and allows microphone resume.
 
-The playback path expects WAV data suitable for the device. The MCP server
+The WAV playback path expects data suitable for the device. The MCP server
 converts generated TTS to 24 kHz, mono, signed 16-bit WAV.
+
+For lower latency speech, firmware also accepts `POST /play/pcm` with raw PCM:
+
+- Format: 24 kHz, mono, signed 16-bit little-endian.
+- Content type: `audio/x-raw;format=s16le;rate=24000;channels=1`.
+- The firmware stops the microphone, starts speaker playback with
+  `M5.Speaker.playRaw()`, computes lip sync from PCM amplitude, and requests
+  microphone resume after playback completes.
+- The MCP server tries Fish Audio PCM streaming first when `TTS_ENGINE` is
+  `fish-audio` and `FISH_AUDIO_KEY` is set. If streaming setup or playback
+  fails, it falls back to the existing WAV `/play` path.
 
 ## Microphone Modes
 
