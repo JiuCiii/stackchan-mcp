@@ -9,11 +9,15 @@
 
 static size_t lipSyncOffset = 0;
 static unsigned long lastLipMs = 0;
+static size_t currentPcmOffset = 0;
+static size_t currentPcmSize = 0;
+static uint32_t currentSampleRate = 24000;
+static uint16_t currentBytesPerFrame = 2;
 
-#define WAV_HEADER_SIZE       44
 #define LIPSYNC_INTERVAL_MS   50
 #define LIPSYNC_CHUNK_SAMPLES 1024
 #define DOWNLOAD_TIMEOUT_MS   10000
+#define MAX_WAV_BYTES         (4 * 1024 * 1024)
 
 // ── FreeRTOS: URLをCore 0に渡すキュー
 //    StringはFreeRTOSキューに乗せられないのでchar配列で渡す
@@ -24,6 +28,96 @@ static QueueHandle_t s_downloadQueue = nullptr;
 static volatile bool s_pendingReady = false;
 static uint8_t*      s_pendingData  = nullptr;
 static size_t        s_pendingSize  = 0;
+
+struct WavInfo {
+    size_t dataOffset;
+    size_t dataSize;
+    uint32_t sampleRate;
+    uint16_t channels;
+    uint16_t bitsPerSample;
+};
+
+static uint16_t readLe16(const uint8_t* p) {
+    return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+}
+
+static uint32_t readLe32(const uint8_t* p) {
+    return (uint32_t)p[0] |
+           ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) |
+           ((uint32_t)p[3] << 24);
+}
+
+static bool parseWavInfo(const uint8_t* data, size_t size, WavInfo* info) {
+    if (!data || !info || size < 12) {
+        Serial.println("[WAV] Invalid: too small");
+        return false;
+    }
+    if (memcmp(data, "RIFF", 4) != 0 || memcmp(data + 8, "WAVE", 4) != 0) {
+        Serial.println("[WAV] Invalid: missing RIFF/WAVE");
+        return false;
+    }
+
+    bool foundFmt = false;
+    bool foundData = false;
+    uint16_t audioFormat = 0;
+    WavInfo parsed = {};
+
+    size_t offset = 12;
+    while (offset + 8 <= size) {
+        const uint8_t* chunk = data + offset;
+        uint32_t chunkSize = readLe32(chunk + 4);
+        size_t payloadOffset = offset + 8;
+        size_t nextOffset = payloadOffset + chunkSize + (chunkSize & 1);
+
+        if (payloadOffset > size || chunkSize > size - payloadOffset) {
+            Serial.printf("[WAV] Invalid: chunk overflow at %u size=%u\n",
+                          (unsigned)offset, (unsigned)chunkSize);
+            return false;
+        }
+
+        if (memcmp(chunk, "fmt ", 4) == 0) {
+            if (chunkSize < 16) {
+                Serial.println("[WAV] Invalid: fmt chunk too small");
+                return false;
+            }
+            audioFormat = readLe16(data + payloadOffset);
+            parsed.channels = readLe16(data + payloadOffset + 2);
+            parsed.sampleRate = readLe32(data + payloadOffset + 4);
+            parsed.bitsPerSample = readLe16(data + payloadOffset + 14);
+            foundFmt = true;
+        } else if (memcmp(chunk, "data", 4) == 0) {
+            parsed.dataOffset = payloadOffset;
+            parsed.dataSize = chunkSize;
+            foundData = true;
+        }
+
+        if (nextOffset <= offset) {
+            Serial.println("[WAV] Invalid: chunk offset overflow");
+            return false;
+        }
+        offset = nextOffset;
+    }
+
+    if (!foundFmt || !foundData) {
+        Serial.println("[WAV] Invalid: missing fmt or data chunk");
+        return false;
+    }
+    if (audioFormat != 1 || parsed.channels != 1 ||
+        parsed.sampleRate != 24000 || parsed.bitsPerSample != 16) {
+        Serial.printf("[WAV] Unsupported: format=%u channels=%u rate=%u bits=%u\n",
+                      audioFormat, parsed.channels,
+                      (unsigned)parsed.sampleRate, parsed.bitsPerSample);
+        return false;
+    }
+    if (parsed.dataSize == 0 || parsed.dataOffset + parsed.dataSize > size) {
+        Serial.println("[WAV] Invalid: bad data chunk");
+        return false;
+    }
+
+    *info = parsed;
+    return true;
+}
 
 // ════════════════════════════════════════
 //  ダウンロードタスク（Core 0で動く）
@@ -104,10 +198,24 @@ void checkPendingPlayback() {
     s_pendingData  = nullptr;
     s_pendingSize  = 0;
 
+    WavInfo wavInfo;
+    if (!parseWavInfo(currentWavData, currentWavSize, &wavInfo)) {
+        Serial.println("[PLAY] Refusing invalid WAV");
+        free(currentWavData);
+        currentWavData = nullptr;
+        currentWavSize = 0;
+        setFaceExpression(FACE_IDLE);
+        return;
+    }
+    currentPcmOffset = wavInfo.dataOffset;
+    currentPcmSize = wavInfo.dataSize;
+    currentSampleRate = wavInfo.sampleRate;
+    currentBytesPerFrame = (wavInfo.channels * wavInfo.bitsPerSample) / 8;
+
     // 再生時間 + 2秒のデッドライン
-    const float bytes_per_sec = 24000.0f * 2.0f;
+    const float bytes_per_sec = (float)currentSampleRate * (float)currentBytesPerFrame;
     playbackDeadlineMs = millis() +
-        (unsigned long)((currentWavSize / bytes_per_sec) * 1000.0f) + 2000;
+        (unsigned long)((currentPcmSize / bytes_per_sec) * 1000.0f) + 2000;
 
     // マイク停止 → スピーカー起動
     if (M5.Mic.isRunning()) {
@@ -123,7 +231,7 @@ void checkPendingPlayback() {
     M5.Speaker.playWav(currentWavData, currentWavSize);
     setFaceExpression(FACE_PLAYING);
 
-    lipSyncOffset = WAV_HEADER_SIZE;
+    lipSyncOffset = currentPcmOffset;
     lastLipMs     = 0;
     isPlaying     = true;
     playbackStartMs  = millis();
@@ -140,14 +248,14 @@ void updateLipSync() {
     if (now - lastLipMs < LIPSYNC_INTERVAL_MS) return;
     lastLipMs = now;
 
-    if (lipSyncOffset < WAV_HEADER_SIZE) lipSyncOffset = WAV_HEADER_SIZE;
-    if (lipSyncOffset >= currentWavSize) {
+    if (lipSyncOffset < currentPcmOffset) lipSyncOffset = currentPcmOffset;
+    if (lipSyncOffset >= currentPcmOffset + currentPcmSize) {
         setMouthOpen(0.0f);
         return;
     }
 
     int16_t* pcm = (int16_t*)(currentWavData + lipSyncOffset);
-    size_t remainBytes = currentWavSize - lipSyncOffset;
+    size_t remainBytes = currentPcmOffset + currentPcmSize - lipSyncOffset;
     size_t samples = min((size_t)LIPSYNC_CHUNK_SAMPLES, remainBytes / sizeof(int16_t));
     if (samples == 0) {
         setMouthOpen(0.0f);
@@ -170,6 +278,9 @@ bool downloadVoice(const String& url, uint8_t** outData, size_t* outSize) {
     HTTPClient http;
     Serial.printf("[DOWNLOAD] URL: %s\n", url.c_str());
 
+    *outData = nullptr;
+    *outSize = 0;
+
     http.begin(url);
     http.setTimeout(DOWNLOAD_TIMEOUT_MS);
     int httpCode = http.GET();
@@ -181,6 +292,12 @@ bool downloadVoice(const String& url, uint8_t** outData, size_t* outSize) {
     }
 
     int len = http.getSize();
+    if (len <= 0 || len > MAX_WAV_BYTES) {
+        Serial.printf("[DOWNLOAD] Invalid content length: %d\n", len);
+        http.end();
+        return false;
+    }
+
     uint8_t* wavData = (uint8_t*)ps_malloc(len);
     if (!wavData) {
         Serial.println("[DOWNLOAD] ps_malloc failed");
@@ -190,17 +307,45 @@ bool downloadVoice(const String& url, uint8_t** outData, size_t* outSize) {
 
     WiFiClient* stream = http.getStreamPtr();
     size_t bytesRead = 0;
-    while (http.connected() && bytesRead < (size_t)len) {
+    unsigned long lastProgressMs = millis();
+    while (bytesRead < (size_t)len) {
         size_t available = stream->available();
         if (available) {
             size_t toRead = min(available, (size_t)(len - bytesRead));
-            stream->readBytes(wavData + bytesRead, toRead);
-            bytesRead += toRead;
+            size_t got = stream->readBytes(wavData + bytesRead, toRead);
+            if (got == 0) {
+                Serial.println("[DOWNLOAD] Read returned 0 bytes");
+                break;
+            }
+            bytesRead += got;
+            lastProgressMs = millis();
+        } else if (!http.connected()) {
+            Serial.println("[DOWNLOAD] Connection closed before full read");
+            break;
+        } else if (millis() - lastProgressMs > DOWNLOAD_TIMEOUT_MS) {
+            Serial.println("[DOWNLOAD] Read timeout");
+            break;
         }
         delay(1);
     }
     http.end();
 
+    if (bytesRead != (size_t)len) {
+        Serial.printf("[DOWNLOAD] Incomplete read: got=%u expected=%u\n",
+                      (unsigned)bytesRead, (unsigned)len);
+        free(wavData);
+        return false;
+    }
+
+    WavInfo wavInfo;
+    if (!parseWavInfo(wavData, (size_t)len, &wavInfo)) {
+        free(wavData);
+        return false;
+    }
+
+    Serial.printf("[DOWNLOAD] Complete: bytes=%u data=%u offset=%u\n",
+                  (unsigned)len, (unsigned)wavInfo.dataSize,
+                  (unsigned)wavInfo.dataOffset);
     *outData = wavData;
     *outSize = (size_t)len;
     return true;
