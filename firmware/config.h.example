@@ -28,6 +28,13 @@
 #define MIC_VOICE_CONFIRM_RMS     0.004f
 #define PRE_TRIGGER_BUFFER_SAMPLES 4800
 
+// HTTP タイムアウト (ms)
+#define HTTP_TIMEOUT_CHAT     30000
+#define HTTP_TIMEOUT_SHORT     5000
+
+// 通知チェック間隔 (ms)
+#define NOTIFICATION_CHECK_INTERVAL 60000
+
 // ディスプレイ
 #define DISPLAY_BRIGHTNESS  70
 
