@@ -99,7 +99,8 @@ python -m mcp_server.server --http --port 8002
 
 The MCP tool `stackchan_listen` is still the normal way for an AI client to
 listen. For host-side experiments, `scripts/stackchan_voice_bridge.py` can poll
-Stack-chan and print transcribed recordings as JSONL:
+Stack-chan and print transcribed recordings as JSONL. It reads project-root
+`.env` like `start-http.sh`, without overriding already exported variables:
 
 ```bash
 # Safe status check. Does not consume the device recording buffer.

@@ -1,4 +1,5 @@
 import importlib.util
+import os
 import struct
 import sys
 import types
@@ -13,6 +14,7 @@ from mcp_server.listening import capture_ready_recording, format_listen_result
 from mcp_server.mcp_tools import can_stream_pcm, register_tools
 from mcp_server.stackchan_client import PcmPlaybackError, StackchanClient, post_pcm_stream
 from mcp_server.stackchan_config import PCM_SAMPLE_WIDTH, StackchanConfig, load_config
+from scripts.stackchan_voice_bridge import load_env_file
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -120,6 +122,27 @@ def test_invalid_pcm_env_values_fall_back_to_defaults(monkeypatch):
     assert config.pcm_limit == 0.90
     assert config.pcm_declick_samples == 64
     assert config.pcm_zero_cross_window == 256
+
+
+def test_voice_bridge_env_loader_does_not_override_existing_values(monkeypatch, tmp_path):
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "\n".join(
+            [
+                "# comments are ignored",
+                "STACKCHAN_IP=192.0.2.55",
+                "export MAC_IP='192.0.2.99'",
+                "FISH_AUDIO_KEY=new-key",
+            ]
+        )
+    )
+    monkeypatch.setenv("FISH_AUDIO_KEY", "existing-key")
+
+    load_env_file(env_path)
+
+    assert os.environ["STACKCHAN_IP"] == "192.0.2.55"
+    assert os.environ["MAC_IP"] == "192.0.2.99"
+    assert os.environ["FISH_AUDIO_KEY"] == "existing-key"
 
 
 def test_validate_playback_wav_accepts_expected_format(tmp_path):
