@@ -146,11 +146,3 @@ recording.
 - If the issue changes established project behavior, update
   `docs/development-guide.md` as well so the general guide stays current.
 
-
-<claude-mem-context>
-# Memory Context
-
-# [stackchan] recent context, 2026-05-28 3:16am GMT+9
-
-No previous sessions found.
-</claude-mem-context>

@@ -283,6 +283,9 @@ It uses RMS thresholds to trigger recording and to end after silence.
 
 - The device stores the latest recording.
 - MCP clients can poll `/audio/status` and then fetch `/audio`.
+- `scripts/stackchan_voice_bridge.py` is a host-side bridge prototype that
+  polls this same path and prints JSONL transcripts. Use `--dry-run --once` to
+  inspect readiness without consuming the recording buffer.
 
 Switch mode with:
 

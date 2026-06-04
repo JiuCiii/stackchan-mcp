@@ -9,6 +9,7 @@ import pytest
 
 from mcp_server import audio_processing
 from mcp_server.audio_server import audio_url
+from mcp_server.listening import capture_ready_recording, format_listen_result
 from mcp_server.mcp_tools import can_stream_pcm, register_tools
 from mcp_server.stackchan_client import PcmPlaybackError, StackchanClient, post_pcm_stream
 from mcp_server.stackchan_config import PCM_SAMPLE_WIDTH, StackchanConfig, load_config
@@ -326,6 +327,51 @@ def test_listen_does_not_consume_audio_when_not_ready():
     register_tools(mcp, FakeClient(), make_config(), lambda data, format: {"data": data, "format": format})
 
     assert "No recording ready" in mcp.tools["stackchan_listen"]()
+
+
+def test_capture_ready_recording_does_not_consume_audio_when_not_ready(tmp_path):
+    class FakeClient:
+        def audio_status(self):
+            return {"ready": False, "mode": "mcp"}
+
+        def get_audio(self):
+            raise AssertionError("GET /audio consumes the device buffer and should not be called")
+
+    result = capture_ready_recording(FakeClient(), make_config(), audio_dir=tmp_path)
+
+    assert result == {
+        "ready": False,
+        "consumed": False,
+        "status": {"ready": False, "mode": "mcp"},
+    }
+    assert "No recording ready" in format_listen_result(result)
+
+
+def test_capture_ready_recording_writes_wav_and_transcribes(monkeypatch, tmp_path):
+    class FakeClient:
+        def audio_status(self):
+            return {"ready": True, "mode": "mcp"}
+
+        def get_audio(self):
+            return b"RIFF-test-wav"
+
+    def fake_transcribe(wav_path, lang, config):
+        assert wav_path.read_bytes() == b"RIFF-test-wav"
+        assert lang == "zh"
+        assert config.fish_audio_key == "test-key"
+        return {"text": "你好，Stackchan", "duration": 1.25, "language": "zh"}
+
+    monkeypatch.setattr(audio_processing, "transcribe_audio", fake_transcribe)
+
+    result = capture_ready_recording(FakeClient(), make_config(), audio_dir=tmp_path)
+
+    assert result["ready"] is True
+    assert result["consumed"] is True
+    assert result["audio_bytes"] == len(b"RIFF-test-wav")
+    assert result["text"] == "你好，Stackchan"
+    assert result["duration"] == 1.25
+    assert Path(result["wav_path"]).exists()
+    assert "你好，Stackchan" in format_listen_result(result)
 
 
 def test_playback_status_formats_runtime_diagnostics():

@@ -5,6 +5,7 @@ import requests
 
 from . import audio_processing
 from .audio_server import AUDIO_DIR, audio_url, start_audio_server
+from .listening import capture_ready_recording, format_listen_result
 from .stackchan_client import PcmPlaybackError, StackchanClient, post_pcm_stream
 from .stackchan_config import VALID_FACES, StackchanConfig
 
@@ -83,23 +84,8 @@ def register_tools(mcp, client: StackchanClient, config: StackchanConfig, image_
     @mcp.tool()
     def stackchan_listen(lang: str = "zh") -> str:
         try:
-            status = client.audio_status()
-            if not status.get("ready"):
-                return "🎤 No recording ready. Stack-chan is listening... (speak to it and try again)"
-
-            audio_data = client.get_audio()
-            if audio_data is None:
-                return "❌ Failed to fetch audio from Stack-chan"
-
-            wav_path = AUDIO_DIR / f"rec_{int(time.time()*1000)}.wav"
-            wav_path.write_bytes(audio_data)
-            asr_result = audio_processing.transcribe_audio(wav_path, lang, config)
-            text = asr_result.get("text", "")
-            asr_duration = asr_result.get("duration", 0)
-            asr_lang = asr_result.get("language", "?")
-            if text:
-                return f"👂 Heard ({asr_duration:.1f}s, {asr_lang}): \"{text}\""
-            return f"🎤 Recording captured ({len(audio_data)} bytes, {asr_duration:.1f}s) but ASR returned empty text. Detected language: {asr_lang}. Audio may be too quiet."
+            result = capture_ready_recording(client, config, lang=lang, audio_dir=AUDIO_DIR)
+            return format_listen_result(result)
         except Exception as exc:
             return f"❌ Error: {exc}"
 

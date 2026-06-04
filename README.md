@@ -95,6 +95,26 @@ Add to `~/.claude.json`:
 python -m mcp_server.server --http --port 8002
 ```
 
+### 6. Prototype voice bridge
+
+The MCP tool `stackchan_listen` is still the normal way for an AI client to
+listen. For host-side experiments, `scripts/stackchan_voice_bridge.py` can poll
+Stack-chan and print transcribed recordings as JSONL:
+
+```bash
+# Safe status check. Does not consume the device recording buffer.
+uv run python scripts/stackchan_voice_bridge.py --dry-run --once
+
+# Consume one ready recording, transcribe it, then exit.
+uv run python scripts/stackchan_voice_bridge.py --once --lang zh
+
+# Keep polling and print each transcript as one JSON line.
+uv run python scripts/stackchan_voice_bridge.py --lang zh
+```
+
+`GET /audio` clears the current recording on the device, so use `--dry-run`
+when you only want to inspect readiness.
+
 ## Faces
 
 Stack-chan has 7 expressions stored as 320x240 PNGs on the device's LittleFS. The default face is a gentle whale with crescent eyes.
