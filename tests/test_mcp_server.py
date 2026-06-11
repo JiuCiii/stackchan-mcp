@@ -1,6 +1,7 @@
 import importlib.util
 import os
 import struct
+import subprocess
 import sys
 import types
 import wave
@@ -12,6 +13,7 @@ from mcp_server import audio_processing
 from mcp_server.audio_server import audio_url
 from mcp_server.listening import capture_ready_recording, format_listen_result
 from mcp_server.mcp_tools import can_stream_pcm, register_tools
+from mcp_server.render_queue_bridge import FACE_MAP, CommandExecutor, QueueConfig, run_bridge
 from mcp_server.stackchan_client import PcmPlaybackError, StackchanClient, post_pcm_stream
 from mcp_server.stackchan_config import PCM_SAMPLE_WIDTH, StackchanConfig, load_config
 from mcp_server.voice_inbox import append_event, clear_events, format_events, read_events
@@ -113,6 +115,74 @@ def test_audio_url_uses_configured_host_and_port():
     assert audio_url("192.0.2.10", 5099, "hello.wav") == "http://192.0.2.10:5099/hello.wav"
 
 
+class FakeStackchanClient:
+    def __init__(self):
+        self.calls = []
+
+    def playback_status(self):
+        return {"free_heap": 123, "free_psram": 456, "servo_ready": True}
+
+    def set_face(self, face):
+        self.calls.append(("face", face))
+        return {"success": True}
+
+    def move(self, x, y, speed):
+        self.calls.append(("move", x, y, speed))
+        return {"success": True}
+
+    def gesture(self, gesture):
+        self.calls.append(("gesture", gesture))
+        return {"success": True}
+
+    def play(self, url):
+        self.calls.append(("play", url))
+        return {"success": True}
+
+
+def test_render_bridge_maps_queue_commands_to_device_api():
+    client = FakeStackchanClient()
+    executor = CommandExecutor(client, make_config())
+
+    executor.execute({"action": "emote", "payload": {"expression": "angry"}})
+    executor.execute({"action": "move_head", "payload": {"pitch": -20, "yaw": 30}})
+    executor.execute({"action": "wiggle", "payload": {}})
+
+    assert FACE_MAP["angry"] == "pouty"
+    assert client.calls == [
+        ("face", "pouty"),
+        ("move", 30.0, 25.0, 50),
+        ("gesture", "shake"),
+    ]
+
+
+def test_render_bridge_reports_successful_command(monkeypatch):
+    class FakeQueue:
+        def __init__(self):
+            self.reports = []
+            self.heartbeats = []
+
+        def heartbeat(self, status):
+            self.heartbeats.append(status)
+
+        def poll(self):
+            return {"id": "cmd-1", "action": "wiggle", "payload": {}}
+
+        def report(self, command_id, *, result=None, error=None):
+            self.reports.append((command_id, result, error))
+
+    monkeypatch.setattr("mcp_server.render_queue_bridge.start_audio_server", lambda _port: None)
+    queue = FakeQueue()
+    executor = CommandExecutor(FakeStackchanClient(), make_config())
+    config = QueueConfig("https://example.test", "token", "device", 0.2, 30)
+
+    run_bridge(queue, executor, config, once=True)
+
+    assert queue.heartbeats[0]["device_online"] is True
+    assert queue.reports[0][0] == "cmd-1"
+    assert queue.reports[0][1]["gesture"] == "shake"
+    assert queue.reports[0][2] is None
+
+
 def test_invalid_pcm_env_values_fall_back_to_defaults(monkeypatch):
     monkeypatch.setenv("STACKCHAN_PCM_GAIN", "loud")
     monkeypatch.setenv("STACKCHAN_PCM_LIMIT", "hot")
@@ -198,6 +268,32 @@ def test_validate_playback_wav_accepts_expected_format(tmp_path):
     write_wav(wav_path)
 
     audio_processing.validate_playback_wav(wav_path)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows SAPI only")
+def test_windows_sapi_generates_device_compatible_wav():
+    try:
+        wav_path = audio_processing.tts_windows_sapi("Stack Chan ready", "en")
+    except subprocess.CalledProcessError as exc:
+        pytest.skip(f"Windows security policy denied SAPI voice access: {exc.returncode}")
+
+    audio_processing.validate_playback_wav(wav_path)
+    assert wav_path.stat().st_size > 44
+
+
+def test_queue_bridge_speak_generates_and_plays_wav(monkeypatch, tmp_path):
+    wav_path = tmp_path / "ready.wav"
+    write_wav(wav_path)
+    client = FakeStackchanClient()
+    config = make_config(mac_ip="192.168.1.10", audio_serve_port=8765)
+    executor = CommandExecutor(client, config)
+    monkeypatch.setattr(audio_processing, "generate_tts", lambda text, lang, config: wav_path)
+
+    result = executor.execute({"action": "speak", "payload": {"text": "ready"}})
+
+    assert client.calls == [("play", "http://192.168.1.10:8765/ready.wav")]
+    assert result["text_length"] == 5
+    assert result["audio"] == "ready.wav"
 
 
 def test_validate_playback_wav_rejects_wrong_format(tmp_path):

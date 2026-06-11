@@ -1,11 +1,12 @@
 import logging
+import tempfile
 import threading
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-AUDIO_DIR = Path("/tmp/stackchan_audio")
+AUDIO_DIR = Path(tempfile.gettempdir()) / "stackchan_audio"
 AUDIO_DIR.mkdir(exist_ok=True)
 TEMP_AUDIO_DIR = AUDIO_DIR / ".tmp"
 TEMP_AUDIO_DIR.mkdir(exist_ok=True)

@@ -165,6 +165,24 @@ If you're building something like this for your AI — or if you are an AI and s
 - [Fish Audio](https://fish.audio) — TTS and ASR APIs
 - Built by xiaoke (小克), maintained with Isa
 
+## Stack Chan deployment helpers
+
+For the Render queue bridge, copy `.env.example` to `.env`, fill the device
+token and LAN addresses, then run:
+
+```bat
+scripts\start_render_queue_bridge.cmd
+```
+
+The Windows deployment helpers default to `COM3` and also accept a port as the
+first argument:
+
+```bat
+scripts\build_firmware.cmd
+scripts\flash_firmware.cmd COM3
+scripts\restore_stock_firmware.cmd COM3
+```
+
 ## License
 
 MIT

@@ -1,6 +1,7 @@
 import os
 import struct
 import subprocess
+import sys
 import time
 import uuid
 import wave
@@ -67,19 +68,24 @@ def tts_edge(text: str, lang: str, config: StackchanConfig) -> Path:
     mp3_path = TEMP_AUDIO_DIR / f"{stem}.mp3"
     temp_wav_path = TEMP_AUDIO_DIR / f"{stem}.wav"
     try:
-        subprocess.run(
-            [
-                config.edge_tts_bin,
-                "--voice",
-                voice,
-                "--text",
-                text,
-                "--write-media",
-                str(mp3_path),
-            ],
-            check=True,
-            capture_output=True,
-        )
+        try:
+            subprocess.run(
+                [
+                    config.edge_tts_bin,
+                    "--voice",
+                    voice,
+                    "--text",
+                    text,
+                    "--write-media",
+                    str(mp3_path),
+                ],
+                check=True,
+                capture_output=True,
+            )
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            if sys.platform != "win32":
+                raise
+            return tts_windows_sapi(text, lang, stem)
         subprocess.run(
             [
                 "ffmpeg",
@@ -100,6 +106,61 @@ def tts_edge(text: str, lang: str, config: StackchanConfig) -> Path:
         return publish_validated_wav(temp_wav_path, stem)
     finally:
         mp3_path.unlink(missing_ok=True)
+        temp_wav_path.unlink(missing_ok=True)
+
+
+def tts_windows_sapi(text: str, lang: str, stem: str | None = None) -> Path:
+    stem = stem or new_tts_stem()
+    temp_wav_path = TEMP_AUDIO_DIR / f"{stem}.wav"
+    culture = "zh-CN" if lang == "zh" else "en-US"
+    script = r"""
+Add-Type -AssemblyName System.Speech
+$synth = New-Object System.Speech.Synthesis.SpeechSynthesizer
+try {
+    $voice = $synth.GetInstalledVoices() |
+        Where-Object { $_.Enabled -and $_.VoiceInfo.Culture.Name -eq $env:STACKCHAN_TTS_CULTURE } |
+        Select-Object -First 1
+    if ($null -ne $voice) {
+        try {
+            $synth.SelectVoice($voice.VoiceInfo.Name)
+        } catch {
+            # Some Windows voice registrations are visible but unavailable to SAPI.
+        }
+    }
+    $format = New-Object System.Speech.AudioFormat.SpeechAudioFormatInfo(
+        24000,
+        [System.Speech.AudioFormat.AudioBitsPerSample]::Sixteen,
+        [System.Speech.AudioFormat.AudioChannel]::Mono
+    )
+    $synth.SetOutputToWaveFile($env:STACKCHAN_TTS_OUTPUT, $format)
+    $synth.Speak($env:STACKCHAN_TTS_TEXT)
+} finally {
+    $synth.Dispose()
+}
+"""
+    env = os.environ.copy()
+    env.update(
+        {
+            "STACKCHAN_TTS_TEXT": text,
+            "STACKCHAN_TTS_CULTURE": culture,
+            "STACKCHAN_TTS_OUTPUT": str(temp_wav_path),
+        }
+    )
+    try:
+        subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                script,
+            ],
+            check=True,
+            capture_output=True,
+            env=env,
+        )
+        return publish_validated_wav(temp_wav_path, stem)
+    finally:
         temp_wav_path.unlink(missing_ok=True)
 
 

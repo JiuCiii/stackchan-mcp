@@ -101,10 +101,8 @@ static void applyMicConfig() {
     auto mic_cfg = M5.Mic.config();
     mic_cfg.sample_rate        = MIC_SAMPLE_RATE;
     mic_cfg.stereo             = false;
-    mic_cfg.magnification      = MIC_MAGNIFICATION;
 //    mic_cfg.dma_buf_len        = MIC_DMA_BUF_LEN;
 //    mic_cfg.dma_buf_count      = MIC_DMA_BUF_COUNT;
-    mic_cfg.noise_filter_level = MIC_NOISE_FILTER_LEVEL;
     M5.Mic.config(mic_cfg);
 }
 
