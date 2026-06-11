@@ -165,6 +165,12 @@ token and LAN addresses, then run:
 scripts\start_render_queue_bridge.cmd
 ```
 
+For a persistent hidden Windows process with PID and log files:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\start_render_queue_bridge_background.ps1
+```
+
 The Windows deployment helpers default to `COM3` and also accept a port as the
 first argument:
 
