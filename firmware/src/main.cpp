@@ -36,11 +36,14 @@ void setup() {
         Serial.println("[WARN] Servo init failed - head movement disabled");
     }
 
+    connectWiFi();
+
+    // Camera DMA startup is memory intensive. Initialize it after Wi-Fi has
+    // settled to avoid overlapping the camera task with radio startup.
     if (!initCamera()) {
         Serial.println("[WARN] Camera init failed - vision disabled");
     }
 
-    connectWiFi();
     initPlayback();
     initHttpServer();
 }

@@ -7,11 +7,13 @@ Usage:
 """
 
 import sys
+from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP, Image
 
 from .audio_server import start_audio_server
 from .mcp_tools import register_tools
+from .render_queue_bridge import load_env_file
 from .stackchan_client import StackchanClient
 from .stackchan_config import StackchanConfig, load_config
 
@@ -33,6 +35,7 @@ def create_mcp(config: StackchanConfig, *, http_mode: bool = False, port: int = 
 
 
 if __name__ == "__main__":
+    load_env_file(Path(__file__).resolve().parents[1] / ".env")
     config = load_config()
     http_mode, mcp_port = parse_args(sys.argv)
     mcp = create_mcp(config, http_mode=http_mode, port=mcp_port)

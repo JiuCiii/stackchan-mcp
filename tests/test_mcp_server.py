@@ -101,7 +101,6 @@ def test_server_entrypoint_registers_expected_tools(monkeypatch):
         "stackchan_move",
         "stackchan_nod",
         "stackchan_shake",
-        "stackchan_face",
         "stackchan_see",
         "stackchan_home",
         "stackchan_status",
@@ -279,6 +278,29 @@ def test_windows_sapi_generates_device_compatible_wav():
 
     audio_processing.validate_playback_wav(wav_path)
     assert wav_path.stat().st_size > 44
+
+
+def test_edge_tts_timeout_falls_back_to_windows_sapi(monkeypatch, tmp_path):
+    fallback_path = tmp_path / "fallback.wav"
+    write_wav(fallback_path)
+    calls = []
+
+    def fake_run(*args, **kwargs):
+        calls.append(kwargs)
+        raise subprocess.TimeoutExpired(args[0], kwargs["timeout"])
+
+    monkeypatch.setattr(audio_processing.subprocess, "run", fake_run)
+    monkeypatch.setattr(audio_processing.sys, "platform", "win32")
+    monkeypatch.setattr(
+        audio_processing,
+        "tts_windows_sapi",
+        lambda text, lang, stem=None: fallback_path,
+    )
+
+    result = audio_processing.tts_edge("ready", "en", make_config())
+
+    assert result == fallback_path
+    assert calls[0]["timeout"] == 15
 
 
 def test_queue_bridge_speak_generates_and_plays_wav(monkeypatch, tmp_path):
@@ -469,17 +491,6 @@ def test_tools_move_clamps_inputs_before_http_call():
     assert "x=128" in result
     assert "y=0" in result
     assert "speed 100%" in result
-
-
-def test_invalid_face_is_rejected_without_http_call():
-    class FakeClient:
-        def set_face(self, _expression):
-            raise AssertionError("HTTP face setter should not be called for invalid expressions")
-
-    mcp = FakeFastMCP()
-    register_tools(mcp, FakeClient(), make_config(), lambda data, format: {"data": data, "format": format})
-
-    assert "Unknown expression" in mcp.tools["stackchan_face"]("surprised")
 
 
 def test_listen_does_not_consume_audio_when_not_ready():

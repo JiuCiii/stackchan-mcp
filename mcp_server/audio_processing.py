@@ -81,8 +81,9 @@ def tts_edge(text: str, lang: str, config: StackchanConfig) -> Path:
                 ],
                 check=True,
                 capture_output=True,
+                timeout=15,
             )
-        except (FileNotFoundError, subprocess.CalledProcessError):
+        except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
             if sys.platform != "win32":
                 raise
             return tts_windows_sapi(text, lang, stem)

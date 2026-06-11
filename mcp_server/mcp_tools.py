@@ -7,7 +7,7 @@ from . import audio_processing
 from .audio_server import AUDIO_DIR, audio_url, start_audio_server
 from .listening import capture_ready_recording, format_listen_result
 from .stackchan_client import PcmPlaybackError, StackchanClient, post_pcm_stream
-from .stackchan_config import VALID_FACES, StackchanConfig
+from .stackchan_config import StackchanConfig
 from .voice_inbox import clear_events, format_events, read_events
 
 logger = logging.getLogger(__name__)
@@ -116,27 +116,6 @@ def register_tools(mcp, client: StackchanClient, config: StackchanConfig, image_
         try:
             result = client.gesture("shake")
             return "🤖 *shakes head no*" if result.get("success") else f"❌ Shake failed: {result}"
-        except Exception as exc:
-            return f"❌ Error: {exc}"
-
-    @mcp.tool()
-    def stackchan_face(expression: str = "calm") -> str:
-        if expression not in VALID_FACES:
-            return f"❌ Unknown expression. Choose from: {', '.join(VALID_FACES)}"
-        try:
-            result = client.set_face(expression)
-            if result.get("success"):
-                faces = {
-                    "calm": "😊",
-                    "thinking": "🤔",
-                    "happy": "🐋",
-                    "sleepy": "😴",
-                    "shy": "😳",
-                    "smug": "😏",
-                    "pouty": "😤",
-                }
-                return f"{faces.get(expression, '🤖')} Face: {expression}"
-            return f"❌ Face change failed: {result}"
         except Exception as exc:
             return f"❌ Error: {exc}"
 

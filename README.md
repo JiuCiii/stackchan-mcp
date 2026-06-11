@@ -24,7 +24,6 @@ the physical world
 | `stackchan_say` | Speak through the speaker (Fish Audio or edge-tts) |
 | `stackchan_listen` | Record from microphone + transcribe (Fish Audio ASR) |
 | `stackchan_see` | Take a photo through the camera (GC0308, 320x240) |
-| `stackchan_face` | Change expression (calm, thinking, happy, sleepy, shy, smug, pouty) |
 | `stackchan_move` | Move head (pan -128 to +128, tilt 0 to 90) |
 | `stackchan_nod` | Nod yes |
 | `stackchan_shake` | Shake head no |
@@ -132,19 +131,11 @@ transcript, the AI reads `stackchan_voice_inbox`, then replies with
 
 ## Faces
 
-Stack-chan has 7 expressions stored as 320x240 PNGs on the device's LittleFS. The default face is a gentle whale with crescent eyes.
+Visual expressions are currently disabled. The display stays blank until the
+final artwork is added, and Claude is not offered a face-control tool.
 
-> **Note:** The included face PNGs are this particular Stack-chan's face — they were designed for him by his person. You'll probably want to replace them with your own. Drop your own 320x240 PNGs into `firmware/data/` before flashing.
-
-| Expression | Description |
-|-----------|-------------|
-| calm | Default. Gentle crescent eyes. |
-| thinking | Chin on hand, pondering. |
-| happy | Closed eyes, whale spout. |
-| sleepy | Zzz bubbles. |
-| shy | Blushing, averted gaze. |
-| smug | Half-lidded, cocky grin. |
-| pouty | Puffed cheeks, annoyed huff. |
+The old placeholder PNG files remain development assets only and are not
+loaded or displayed by the firmware.
 
 ## TTS Voices
 
@@ -181,6 +172,12 @@ first argument:
 scripts\build_firmware.cmd
 scripts\flash_firmware.cmd COM3
 scripts\restore_stock_firmware.cmd COM3
+```
+
+On Windows, Claude Code can launch the stdio MCP server through:
+
+```bat
+scripts\start_claude_mcp.cmd
 ```
 
 ## License
